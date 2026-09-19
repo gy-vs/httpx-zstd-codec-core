@@ -17,6 +17,13 @@ except ImportError:  # pragma: no cover
     except ImportError:
         brotli = None
 
+# Zstandard support is optional
+# See: https://pypi.org/project/zstandard/
+try:
+    import zstandard
+except ImportError:  # pragma: no cover
+    zstandard = None  # type: ignore
+
 if sys.version_info >= (3, 10) or ssl.OPENSSL_VERSION_INFO >= (1, 1, 0, 7):
 
     def set_minimum_tls_version_1_2(context: ssl.SSLContext) -> None:
@@ -39,4 +46,4 @@ else:
         context.options |= ssl.OP_NO_TLSv1_1
 
 
-__all__ = ["brotli", "set_minimum_tls_version_1_2"]
+__all__ = ["brotli", "set_minimum_tls_version_1_2", "zstandard"]

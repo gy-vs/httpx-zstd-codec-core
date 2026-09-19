@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import struct
+import subprocess
+import sys
 import typing
 import zlib
 
@@ -73,6 +76,191 @@ def test_brotli():
     assert response.content == body
 
 
+def test_zstd():
+    zstandard = pytest.importorskip("zstandard")
+
+    body = b"test 123"
+    compressed_body = zstandard.ZstdCompressor().compress(body)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+
+def test_zstd_multiple_frames():
+    zstandard = pytest.importorskip("zstandard")
+
+    body = b"test 123"
+    compressed_body = zstandard.ZstdCompressor().compress(body)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body + compressed_body,
+    )
+    assert response.content == body + body
+
+
+def test_zstd_skippable_frame():
+    zstandard = pytest.importorskip("zstandard")
+
+    body = b"test 123"
+    compressed_body = zstandard.ZstdCompressor().compress(body)
+    # See: https://www.rfc-editor.org/rfc/rfc8878#name-skippable-frames
+    skippable_payload = b"skippable"
+    skippable_frame = (
+        struct.pack("<I", 0x184D2A50)
+        + struct.pack("<I", len(skippable_payload))
+        + skippable_payload
+    )
+
+    headers = [(b"Content-Encoding", b"zstd")]
+
+    # A skippable frame may appear before the zstd frames.
+    response = httpx.Response(
+        200, headers=headers, content=skippable_frame + compressed_body
+    )
+    assert response.content == body
+
+    # A skippable frame may appear between zstd frames.
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body + skippable_frame + compressed_body,
+    )
+    assert response.content == body + body
+
+    # A skippable frame may appear after the zstd frames.
+    response = httpx.Response(
+        200, headers=headers, content=compressed_body + skippable_frame
+    )
+    assert response.content == body
+
+    # A stream containing only skippable frames decodes to empty content.
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=skippable_frame + skippable_frame,
+    )
+    assert response.content == b""
+
+
+def test_zstd_skippable_frame_split_across_chunks():
+    zstandard = pytest.importorskip("zstandard")
+    from httpx._decoders import ZStandardDecoder
+
+    body = b"test 123"
+    compressed_body = zstandard.ZstdCompressor().compress(body)
+    skippable_payload = b"skippable"
+    skippable_frame = (
+        struct.pack("<I", 0x184D2A50)
+        + struct.pack("<I", len(skippable_payload))
+        + skippable_payload
+    )
+
+    # The skippable frame header itself spans two decode calls.
+    decoder = ZStandardDecoder()
+    decoded = (
+        decoder.decode(skippable_frame[:3])
+        + decoder.decode(skippable_frame[3:] + compressed_body)
+        + decoder.flush()
+    )
+    assert decoded == body
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 8, 16, 128])
+def test_zstd_streaming_chunk_boundaries(chunk_size):
+    zstandard = pytest.importorskip("zstandard")
+
+    body = b"test 123" * 100
+    compressed_body = zstandard.ZstdCompressor().compress(body)
+    skippable_payload = b"skippable"
+    skippable_frame = (
+        struct.pack("<I", 0x184D2A50)
+        + struct.pack("<I", len(skippable_payload))
+        + skippable_payload
+    )
+    compressed = compressed_body + skippable_frame + compressed_body
+    chunks = [
+        compressed[i : i + chunk_size]
+        for i in range(0, len(compressed), chunk_size)
+    ]
+
+    headers = [(b"Content-Encoding", b"zstd")]
+
+    response = httpx.Response(200, headers=headers, content=iter(chunks))
+    assert b"".join(response.iter_bytes()) == body + body
+    assert response.num_bytes_downloaded == len(compressed)
+
+
+@pytest.mark.anyio
+async def test_zstd_async_streaming():
+    zstandard = pytest.importorskip("zstandard")
+
+    body = b"test 123" * 100
+    compressed_body = zstandard.ZstdCompressor().compress(body)
+    skippable_payload = b"skippable"
+    skippable_frame = (
+        struct.pack("<I", 0x184D2A50)
+        + struct.pack("<I", len(skippable_payload))
+        + skippable_payload
+    )
+    compressed = compressed_body + skippable_frame + compressed_body
+    chunks = [compressed[i : i + 7] for i in range(0, len(compressed), 7)]
+
+    async def compress() -> typing.AsyncIterator[bytes]:
+        for chunk in chunks:
+            yield chunk
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=compress())
+    assert not hasattr(response, "body")
+    assert await response.aread() == body + body
+    assert response.num_bytes_downloaded == len(compressed)
+
+
+def test_zstd_empty_content():
+    pytest.importorskip("zstandard")
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=b"")
+    assert response.content == b""
+
+
+def test_zstd_corrupt_data():
+    pytest.importorskip("zstandard")
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(200, headers=headers, content=b"invalid")
+
+
+def test_zstd_truncated_frame():
+    zstandard = pytest.importorskip("zstandard")
+
+    compressed_body = zstandard.ZstdCompressor().compress(b"test 123" * 100)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200, headers=headers, content=compressed_body[:10]
+        )
+
+    # A truncated frame in a streaming response raises on completion.
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=[compressed_body[:10]],
+    )
+    with pytest.raises(httpx.DecodingError):
+        b"".join(response.iter_bytes())
+
+
 def test_multi():
     body = b"test 123"
 
@@ -85,6 +273,40 @@ def test_multi():
     )
 
     headers = [(b"Content-Encoding", b"deflate, gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+
+def test_multi_with_zstd():
+    zstandard = pytest.importorskip("zstandard")
+
+    body = b"test 123"
+    compressed_body = zstandard.ZstdCompressor().compress(body)
+
+    # `zstd, gzip` means zstd was applied first, then gzip.
+    gzip_compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    compressed_body = (
+        gzip_compressor.compress(compressed_body) + gzip_compressor.flush()
+    )
+
+    headers = [(b"Content-Encoding", b"zstd, gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+    # `gzip, zstd` means gzip was applied first, then zstd.
+    gzip_compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    gzip_body = gzip_compressor.compress(body) + gzip_compressor.flush()
+    compressed_body = zstandard.ZstdCompressor().compress(gzip_body)
+
+    headers = [(b"Content-Encoding", b"gzip, zstd")]
     response = httpx.Response(
         200,
         headers=headers,
@@ -133,7 +355,9 @@ async def test_streaming():
     assert await response.aread() == body
 
 
-@pytest.mark.parametrize("header_value", (b"deflate", b"gzip", b"br", b"identity"))
+@pytest.mark.parametrize(
+    "header_value", (b"deflate", b"gzip", b"br", b"zstd", b"identity")
+)
 def test_empty_content(header_value):
     headers = [(b"Content-Encoding", header_value)]
     response = httpx.Response(
@@ -144,14 +368,96 @@ def test_empty_content(header_value):
     assert response.content == b""
 
 
-@pytest.mark.parametrize("header_value", (b"deflate", b"gzip", b"br", b"identity"))
+@pytest.mark.parametrize(
+    "header_value", (b"deflate", b"gzip", b"br", b"zstd", b"identity")
+)
 def test_decoders_empty_cases(header_value):
     headers = [(b"Content-Encoding", header_value)]
     response = httpx.Response(content=b"", status_code=200, headers=headers)
     assert response.read() == b""
 
 
-@pytest.mark.parametrize("header_value", (b"deflate", b"gzip", b"br"))
+def test_zstd_decoder_requires_zstandard(monkeypatch):
+    # Simulate the optional 'zstandard' package not being installed.
+    import httpx._decoders as decoders
+
+    monkeypatch.setattr(decoders, "zstandard", None)
+    with pytest.raises(ImportError, match="httpx\\[zstd\\]"):
+        decoders.ZStandardDecoder()
+
+
+def test_zstd_decoder_registration():
+    import httpx._decoders as decoders
+
+    try:
+        import zstandard  # noqa: F401
+    except ImportError:
+        assert "zstd" not in decoders.SUPPORTED_DECODERS
+    else:
+        assert "zstd" in decoders.SUPPORTED_DECODERS
+
+
+def test_zstd_accept_encoding():
+    # The default Accept-Encoding header must agree with the installed
+    # content decoders.
+    from httpx._client import ACCEPT_ENCODING
+
+    assert ("zstd" in ACCEPT_ENCODING) == (
+        "zstd" in httpx._decoders.SUPPORTED_DECODERS
+    )
+
+
+def test_zstd_without_optional_dependency():
+    """
+    Importing httpx must not fail when 'zstandard' is not installed,
+    and zstd must not be advertised in the default Accept-Encoding.
+    """
+    code = """
+import sys
+import builtins
+
+real_import = builtins.__import__
+
+
+def blocked_import(name, *args, **kwargs):
+    if name == "zstandard" or name.startswith("zstandard."):
+        raise ImportError("No module named 'zstandard'")
+    return real_import(name, *args, **kwargs)
+
+
+builtins.__import__ = blocked_import
+
+import httpx
+
+assert httpx._compat.zstandard is None
+assert "zstd" not in httpx._decoders.SUPPORTED_DECODERS
+from httpx._client import ACCEPT_ENCODING
+
+assert "zstd" not in ACCEPT_ENCODING
+
+# Instantiating the decoder fails with an informative error,
+# but responses with an unsupported encoding pass through.
+try:
+    httpx._decoders.ZStandardDecoder()
+except ImportError:
+    pass
+else:
+    raise AssertionError("ZStandardDecoder() should raise ImportError")
+
+response = httpx.Response(
+    200, headers=[("Content-Encoding", "zstd")], content=b"raw"
+)
+assert response.content == b"raw"
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("header_value", (b"deflate", b"gzip", b"br", b"zstd"))
 def test_decoding_errors(header_value):
     headers = [(b"Content-Encoding", header_value)]
     compressed_body = b"invalid"

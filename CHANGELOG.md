@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## Unreleased
 
+### Added
+
+* Support for `Content-Encoding: zstd`, using the optional `zstandard` package (`pip install httpx[zstd]`). Multiple concatenated frames and skippable frames are handled, and `zstd` is included in the default `Accept-Encoding` header when the package is installed.
+
 ### Fixed
 
 * Fix `app` type signature in `ASGITransport`. (#3109)
