@@ -11,7 +11,7 @@ import io
 import typing
 import zlib
 
-from ._compat import brotli
+from ._compat import brotli, zstandard
 from ._exceptions import DecodingError
 
 
@@ -138,6 +138,69 @@ class BrotliDecoder(ContentDecoder):
             return b""
         except brotli.error as exc:  # pragma: no cover
             raise DecodingError(str(exc)) from exc
+
+
+class ZStandardDecoder(ContentDecoder):
+    """
+    Handle 'zstd' RFC 8878 decoding.
+
+    Requires `pip install zstandard`.
+    Can be installed as a dependency of httpx using `pip install httpx[zstd]`.
+    """
+
+    # inspired by the ZstdDecoder implementation in urllib3
+    def __init__(self) -> None:
+        if zstandard is None:  # pragma: no cover
+            raise ImportError(
+                "Using 'ZStandardDecoder', but the 'zstandard' package "
+                "has not been installed. "
+                "Make sure to install httpx using `pip install httpx[zstd]`."
+            ) from None
+
+        self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+        self.seen_data = False
+        self._have_finished_frame = False
+
+    def decode(self, data: bytes) -> bytes:
+        assert zstandard is not None
+        if not data:
+            return b""
+        self.seen_data = True
+        output = io.BytesIO()
+        try:
+            while True:
+                output.write(self.decompressor.decompress(data))
+                if not self.decompressor.eof:
+                    # The data is being buffered as part of a frame which is
+                    # not yet complete, so we're waiting for more input.
+                    self._have_finished_frame = False
+                    break
+                # A frame (either a regular zstd frame or a skippable frame)
+                # has been fully consumed. Pull any trailing bytes out, and
+                # reset the decompressor for the next frame. We reset
+                # unconditionally, even when there is no trailing data, since
+                # a decompressor cannot be reused once it has reached EOF, and
+                # the next chunk may begin on a frame boundary.
+                data = self.decompressor.unused_data
+                self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+                self._have_finished_frame = True
+                if not data:
+                    break
+        except zstandard.ZstdError as exc:
+            raise DecodingError(str(exc)) from exc
+        return output.getvalue()
+
+    def flush(self) -> bytes:
+        if not self.seen_data:
+            return b""
+        assert zstandard is not None
+        try:
+            data = bytes(self.decompressor.flush())  # note: this is a no-op
+        except zstandard.ZstdError as exc:  # pragma: no cover
+            raise DecodingError(str(exc)) from exc
+        if not self.decompressor.eof and not self._have_finished_frame:
+            raise DecodingError("Zstandard data is incomplete")
+        return data
 
 
 class MultiDecoder(ContentDecoder):
@@ -323,8 +386,11 @@ SUPPORTED_DECODERS = {
     "gzip": GZipDecoder,
     "deflate": DeflateDecoder,
     "br": BrotliDecoder,
+    "zstd": ZStandardDecoder,
 }
 
 
 if brotli is None:
     SUPPORTED_DECODERS.pop("br")  # pragma: no cover
+if zstandard is None:
+    SUPPORTED_DECODERS.pop("zstd")  # pragma: no cover
